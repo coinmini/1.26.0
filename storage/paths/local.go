@@ -459,7 +459,7 @@ func (st *Local) Reserve(ctx context.Context, sid storiface.SectorRef, ft storif
 	return done, nil
 }
 
-func (st *Local) AcquireSector(ctx context.Context, sid storiface.SectorRef, existing storiface.SectorFileType, allocate storiface.SectorFileType, pathType storiface.PathType, op storiface.AcquireMode) (storiface.SectorPaths, storiface.SectorPaths, error) {
+func (st *Local) acquireSector(ctx context.Context, sid storiface.SectorRef, existing storiface.SectorFileType, allocate storiface.SectorFileType, pathType storiface.PathType, op storiface.AcquireMode) (storiface.SectorPaths, storiface.SectorPaths, error) {
 	if existing|allocate != existing^allocate {
 		return storiface.SectorPaths{}, storiface.SectorPaths{}, xerrors.New("can't both find and allocate a sector")
 	}
@@ -557,6 +557,65 @@ func (st *Local) AcquireSector(ctx context.Context, sid storiface.SectorRef, exi
 	}
 
 	return out, storageIDs, nil
+}
+
+func (st *Local) AcquireSector(ctx context.Context, sid storiface.SectorRef, existing storiface.SectorFileType, allocate storiface.SectorFileType, pathType storiface.PathType, op storiface.AcquireMode) (storiface.SectorPaths, storiface.SectorPaths, error) {
+	if allocate != storiface.FTNone || pathType != storiface.PathStorage || os.Getenv("NO_SYNC_PATCH") == "off" {
+		return st.acquireSector(ctx, sid, existing, allocate, pathType, op)
+	}
+	checkDeclareSector := func(id storiface.ID, p *path, sid abi.SectorID, fileType storiface.SectorFileType) {
+		spath := p.sectorPath(sid, fileType)
+		if fileType == storiface.FTCache || fileType == storiface.FTUpdateCache {
+			spath = filepath.Join(spath, "p_aux")
+		}
+		_, err := os.Stat(spath)
+		if err != nil {
+			return
+		}
+		err = st.index.StorageDeclareSector(ctx, id, sid, fileType, true)
+		log.Infof("checkDeclareSector %s, %s, %s, %v", id, sid, fileType, err)
+	}
+	checkUnsealed := existing&storiface.FTUnsealed != 0
+	checkSealed := existing&storiface.FTSealed != 0
+	checkUpdate := existing&storiface.FTUpdate != 0
+	checkCache := existing&storiface.FTCache != 0
+	checkUpdateCache := existing&storiface.FTUpdateCache != 0
+	out, storageIDs, err := st.acquireSector(ctx, sid, existing, allocate, pathType, op)
+	if err != nil {
+		return out, storageIDs, err
+	}
+	if !((checkUnsealed && out.Unsealed == "") ||
+		(checkSealed && out.Sealed == "") ||
+		(checkUpdate && out.Update == "") ||
+		(checkCache && out.Cache == "") ||
+		(checkUpdateCache && out.UpdateCache == "")) {
+		return out, storageIDs, err
+	}
+	for id, p := range st.paths {
+		if p.local == "" {
+			continue
+		}
+		si, err := st.index.StorageInfo(ctx, id)
+		if err != nil || !si.CanStore {
+			continue
+		}
+		if checkUnsealed && out.Unsealed == "" {
+			checkDeclareSector(id, p, sid.ID, storiface.FTUnsealed)
+		}
+		if checkSealed && out.Sealed == "" {
+			checkDeclareSector(id, p, sid.ID, storiface.FTSealed)
+		}
+		if checkUpdate && out.Update == "" {
+			checkDeclareSector(id, p, sid.ID, storiface.FTUpdate)
+		}
+		if checkCache && out.Cache == "" {
+			checkDeclareSector(id, p, sid.ID, storiface.FTCache)
+		}
+		if checkUpdateCache && out.UpdateCache == "" {
+			checkDeclareSector(id, p, sid.ID, storiface.FTUpdateCache)
+		}
+	}
+	return st.acquireSector(ctx, sid, existing, allocate, pathType, op)
 }
 
 func (st *Local) Local(ctx context.Context) ([]storiface.StoragePath, error) {
